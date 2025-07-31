@@ -13,11 +13,12 @@ import java.util.concurrent.CopyOnWriteArrayList
 /**
  * Tracks all Bluetooth connections and handles cleanup
  */
-class BluetoothConnectionTracker(
+open class BluetoothConnectionTracker(
     private val connectionScope: CoroutineScope,
-    private val powerManager: PowerManager
+    private val powerManager: PowerManager,
+    private val delegate: BluetoothConnectionManagerDelegate? = null
 ) {
-    
+
     companion object {
         private const val TAG = "BluetoothConnectionTracker"
         private const val CONNECTION_RETRY_DELAY = 5000L
@@ -25,21 +26,22 @@ class BluetoothConnectionTracker(
         private const val CLEANUP_DELAY = 500L
         private const val CLEANUP_INTERVAL = 30000L // 30 seconds
     }
-    
+
     // Connection tracking - reduced memory footprint
     private val connectedDevices = ConcurrentHashMap<String, DeviceConnection>()
     private val subscribedDevices = CopyOnWriteArrayList<BluetoothDevice>()
     val addressPeerMap = ConcurrentHashMap<String, String>()
-    
+
     // RSSI tracking from scan results (for devices we discover but may connect as servers)
     private val scanRSSI = ConcurrentHashMap<String, Int>()
-    
+
     // Connection attempt tracking with automatic cleanup
     private val pendingConnections = ConcurrentHashMap<String, ConnectionAttempt>()
-    
+
     // State management
     private var isActive = false
-    
+    private var previousSize = connectedDevices.size
+
     /**
      * Consolidated device connection information
      */
@@ -51,7 +53,7 @@ class BluetoothConnectionTracker(
         val isClient: Boolean = false,
         val connectedAt: Long = System.currentTimeMillis()
     )
-    
+
     /**
      * Connection attempt tracking with automatic expiry
      */
@@ -59,14 +61,14 @@ class BluetoothConnectionTracker(
         val attempts: Int,
         val lastAttempt: Long = System.currentTimeMillis()
     ) {
-        fun isExpired(): Boolean = 
+        fun isExpired(): Boolean =
             System.currentTimeMillis() - lastAttempt > CONNECTION_RETRY_DELAY * 2
-        
-        fun shouldRetry(): Boolean = 
-            attempts < MAX_CONNECTION_ATTEMPTS && 
-            System.currentTimeMillis() - lastAttempt > CONNECTION_RETRY_DELAY
+
+        fun shouldRetry(): Boolean =
+            attempts < MAX_CONNECTION_ATTEMPTS &&
+                    System.currentTimeMillis() - lastAttempt > CONNECTION_RETRY_DELAY
     }
-    
+
     /**
      * Start the connection tracker
      */
@@ -74,7 +76,7 @@ class BluetoothConnectionTracker(
         isActive = true
         startPeriodicCleanup()
     }
-    
+
     /**
      * Stop the connection tracker
      */
@@ -83,143 +85,136 @@ class BluetoothConnectionTracker(
         cleanupAllConnections()
         clearAllConnections()
     }
-    
+
     /**
      * Add a device connection
      */
     fun addDeviceConnection(deviceAddress: String, deviceConn: DeviceConnection) {
-        Log.d(TAG, "Tracker: Adding device connection for $deviceAddress (isClient: ${deviceConn.isClient}")
         connectedDevices[deviceAddress] = deviceConn
         pendingConnections.remove(deviceAddress)
     }
-    
+
     /**
      * Update a device connection
      */
     fun updateDeviceConnection(deviceAddress: String, deviceConn: DeviceConnection) {
         connectedDevices[deviceAddress] = deviceConn
     }
-    
+
     /**
      * Get a device connection
      */
     fun getDeviceConnection(deviceAddress: String): DeviceConnection? {
         return connectedDevices[deviceAddress]
     }
-    
+
     /**
      * Get all connected devices
      */
     fun getConnectedDevices(): Map<String, DeviceConnection> {
         return connectedDevices.toMap()
     }
-    
+
     /**
      * Get subscribed devices (for server connections)
      */
     fun getSubscribedDevices(): List<BluetoothDevice> {
         return subscribedDevices.toList()
     }
-    
+
     /**
      * Get current RSSI for a device address
      */
     fun getDeviceRSSI(deviceAddress: String): Int? {
         return connectedDevices[deviceAddress]?.rssi?.takeIf { it != Int.MIN_VALUE }
     }
-    
+
     /**
      * Store RSSI from scan results
      */
     fun updateScanRSSI(deviceAddress: String, rssi: Int) {
         scanRSSI[deviceAddress] = rssi
     }
-    
+
     /**
      * Get best available RSSI for a device (connection RSSI preferred, then scan RSSI)
      */
     fun getBestRSSI(deviceAddress: String): Int? {
         // Prefer connection RSSI if available and valid
         connectedDevices[deviceAddress]?.rssi?.takeIf { it != Int.MIN_VALUE }?.let { return it }
-        
+
         // Fall back to scan RSSI
         return scanRSSI[deviceAddress]
     }
-    
+
     /**
      * Add a subscribed device
      */
     fun addSubscribedDevice(device: BluetoothDevice) {
         subscribedDevices.add(device)
     }
-    
+
     /**
      * Remove a subscribed device
      */
     fun removeSubscribedDevice(device: BluetoothDevice) {
         subscribedDevices.remove(device)
     }
-    
+
     /**
      * Check if device is already connected
      */
     fun isDeviceConnected(deviceAddress: String): Boolean {
         return connectedDevices.containsKey(deviceAddress)
     }
-    
+
     /**
      * Check if connection attempt is allowed
      */
     fun isConnectionAttemptAllowed(deviceAddress: String): Boolean {
         val existingAttempt = pendingConnections[deviceAddress]
-        return existingAttempt?.let { 
-            it.isExpired() || it.shouldRetry() 
+        return existingAttempt?.let {
+            it.isExpired() || it.shouldRetry()
         } ?: true
     }
-    
+
     /**
      * Add a pending connection attempt
      */
     fun addPendingConnection(deviceAddress: String): Boolean {
-        Log.d(TAG, "Tracker: Adding pending connection for $deviceAddress")
         synchronized(pendingConnections) {
             // Double-check inside synchronized block
             val currentAttempt = pendingConnections[deviceAddress]
             if (currentAttempt != null && !currentAttempt.isExpired() && !currentAttempt.shouldRetry()) {
-                Log.d(TAG, "Tracker: Connection attempt already in progress for $deviceAddress")
                 return false
             }
-            if (currentAttempt != null) {
-                Log.d(TAG, "Tracker: current attempt: $currentAttempt")
-            }
-            
+
             // Update connection attempt atomically
             val attempts = (currentAttempt?.attempts ?: 0) + 1
             pendingConnections[deviceAddress] = ConnectionAttempt(attempts)
-            Log.d(TAG, "Tracker: Added pending connection for $deviceAddress (attempts: $attempts)")
             return true
         }
     }
-    
+
     /**
      * Remove a pending connection
      */
     fun removePendingConnection(deviceAddress: String) {
         pendingConnections.remove(deviceAddress)
     }
-    
+
     /**
      * Get connected device count
      */
     fun getConnectedDeviceCount(): Int = connectedDevices.size
-    
+
     /**
      * Check if connection limit is reached
      */
     fun isConnectionLimitReached(): Boolean {
         return connectedDevices.size >= powerManager.getMaxConnections()
     }
-    
+
     /**
      * Enforce connection limits by disconnecting oldest connections
      */
@@ -227,12 +222,12 @@ class BluetoothConnectionTracker(
         val maxConnections = powerManager.getMaxConnections()
         if (connectedDevices.size > maxConnections) {
             Log.i(TAG, "Enforcing connection limit: ${connectedDevices.size} > $maxConnections")
-            
+
             // Disconnect oldest client connections first
             val sortedConnections = connectedDevices.values
                 .filter { it.isClient }
                 .sortedBy { it.connectedAt }
-            
+
             val toDisconnect = sortedConnections.take(connectedDevices.size - maxConnections)
             toDisconnect.forEach { deviceConn ->
                 Log.d(TAG, "Disconnecting ${deviceConn.device.address} due to connection limit")
@@ -240,7 +235,7 @@ class BluetoothConnectionTracker(
             }
         }
     }
-    
+
     /**
      * Clean up a specific device connection
      */
@@ -248,11 +243,14 @@ class BluetoothConnectionTracker(
         connectedDevices.remove(deviceAddress)?.let { deviceConn ->
             subscribedDevices.removeAll { it.address == deviceAddress }
             addressPeerMap.remove(deviceAddress)
+            delegate?.onDeviceDisconnected(deviceConn.device) // we need to notify delegate
         }
+        // CRITICAL FIX: Always remove from pending connections when cleaning up
+        // This prevents failed connections from blocking future attempts
         pendingConnections.remove(deviceAddress)
         Log.d(TAG, "Cleaned up device connection for $deviceAddress")
     }
-    
+
     /**
      * Clean up all connections
      */
@@ -260,10 +258,10 @@ class BluetoothConnectionTracker(
         connectedDevices.values.forEach { deviceConn ->
             deviceConn.gatt?.disconnect()
         }
-        
+
         connectionScope.launch {
             delay(CLEANUP_DELAY)
-            
+
             connectedDevices.values.forEach { deviceConn ->
                 try {
                     deviceConn.gatt?.close()
@@ -273,7 +271,7 @@ class BluetoothConnectionTracker(
             }
         }
     }
-    
+
     /**
      * Clear all connection tracking
      */
@@ -284,7 +282,7 @@ class BluetoothConnectionTracker(
         pendingConnections.clear()
         scanRSSI.clear()
     }
-    
+
     /**
      * Start periodic cleanup of expired connections
      */
@@ -292,29 +290,45 @@ class BluetoothConnectionTracker(
         connectionScope.launch {
             while (isActive) {
                 delay(CLEANUP_INTERVAL)
-                
+                previousSize = connectedDevices.size
+
                 if (!isActive) break
-                
+
                 try {
                     // Clean up expired pending connections
                     val expiredConnections = pendingConnections.filter { it.value.isExpired() }
                     expiredConnections.keys.forEach { pendingConnections.remove(it) }
-                    
+
+                    // Clean up stale connections (no activity for 60 seconds)
+                    val now = System.currentTimeMillis()
+                    connectedDevices.entries.removeAll{ (address, deviceConn) ->
+                        val isStale = now - deviceConn.connectedAt > 60000L
+                        if (isStale) {
+                            cleanupDeviceConnection(address)
+                            true
+                        }else {
+                            false
+                        }
+                    }
+
                     // Log cleanup if any
                     if (expiredConnections.isNotEmpty()) {
                         Log.d(TAG, "Cleaned up ${expiredConnections.size} expired connection attempts")
                     }
-                    
+                    if (connectedDevices.size < previousSize) {
+                        Log.d(TAG, "Cleaned up ${previousSize - connectedDevices.size} stale connections")
+                    }
+
                     // Log current state
                     Log.d(TAG, "Periodic cleanup: ${connectedDevices.size} connections, ${pendingConnections.size} pending")
-                    
+
                 } catch (e: Exception) {
                     Log.w(TAG, "Error in periodic cleanup: ${e.message}")
                 }
             }
         }
     }
-    
+
     /**
      * Get debug information
      */
@@ -323,7 +337,7 @@ class BluetoothConnectionTracker(
             appendLine("Connected Devices: ${connectedDevices.size} / ${powerManager.getMaxConnections()}")
             connectedDevices.forEach { (address, deviceConn) ->
                 val age = (System.currentTimeMillis() - deviceConn.connectedAt) / 1000
-                appendLine("  - $address (we're ${if (deviceConn.isClient) "client" else "server"}, ${age}s, RSSI: ${deviceConn.rssi})")
+                appendLine("  - $address (${if (deviceConn.isClient) "client" else "server"}, ${age}s, RSSI: ${deviceConn.rssi})")
             }
             appendLine()
             appendLine("Subscribed Devices (server mode): ${subscribedDevices.size}")
